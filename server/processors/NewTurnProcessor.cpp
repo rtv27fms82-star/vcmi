@@ -35,6 +35,12 @@
 #include "../../lib/pathfinder/TurnInfo.h"
 #include "../../lib/texts/CGeneralTextHandler.h"
 
+#include "../../lib/CCreatureHandler.h"
+#include "../../lib/filesystem/Filesystem.h"
+#include "../../lib/json/JsonNode.h"
+#include "../../lib/mapObjects/CGCreature.h"
+
+#include <limits>
 #include <vstd/RNG.h>
 
 NewTurnProcessor::NewTurnProcessor(CGameHandler * gameHandler)
@@ -192,6 +198,108 @@ void NewTurnProcessor::onPlayerTurnEnded(PlayerColor which)
 		gameHandler->heroPool->onNewWeek(which);
 }
 
+// DIPLO_ENGINE_BEGIN
+// Diplo options that need this source patch. Every number lives in a JSON file of an active Diplo submod;
+// without the file the engine keeps the stock VCMI 1.7.5 behaviour.
+namespace DiploEngine
+{
+static JsonNode loadConfig(const std::string & path)
+{
+	const JsonPath resource = JsonPath::builtin(path);
+	if(!CResourceHandler::get()->existsResource(resource))
+		return JsonNode();
+	return JsonNode(resource);
+}
+
+static int64_t saturatingMultiply(int64_t a, int64_t b, int64_t limit)
+{
+	if(a <= 0 || b <= 0)
+		return 0;
+	if(a > limit / b)
+		return limit;
+	return std::min(a * b, limit);
+}
+
+static int64_t readInteger(const JsonNode & node, const std::string & key, int64_t fallback, int64_t minimum, int64_t maximum)
+{
+	if(!node[key].isNumber())
+		return fallback;
+	return std::clamp<int64_t>(node[key].Integer(), minimum, maximum);
+}
+
+/// Option 02. Troops: N x (1 + K x finishedWeeks). Resources: ratio x N x (1 + K x finishedWeeks).
+/// Returns 0 when neither the N nor the K submod is active.
+static int64_t aiFactor(int64_t finishedWeeks, bool resources)
+{
+	static const JsonNode configN = loadConfig("config/vnd30/engine/aiGrowthN.json");
+	static const JsonNode configK = loadConfig("config/vnd30/engine/aiGrowthK.json");
+	if(configN.isNull() && configK.isNull())
+		return 0;
+	const int64_t limit = 1000000000;
+	const int64_t multiplierN = readInteger(configN, "N", 1, 0, limit);
+	const int64_t multiplierK = readInteger(configK, "K", 0, 0, limit);
+	const int64_t ratio = readInteger(configN, "resourceRatio", 10, 0, limit);
+	const int64_t ramp = std::min(limit, 1 + saturatingMultiply(multiplierK, std::max<int64_t>(finishedWeeks, 0), limit));
+	const int64_t troops = saturatingMultiply(multiplierN, ramp, limit);
+	return resources ? saturatingMultiply(troops, ratio, limit) : troops;
+}
+
+/// Option 12. Weekly random neutral stacks of the configured levels.
+static void spawnWeeklyMonsters(CGameHandler * gameHandler, int64_t newWeek)
+{
+	static const JsonNode config = loadConfig("config/vnd30/engine/weeklySpawn.json");
+	if(config.isNull())
+		return;
+
+	const int64_t startWeek = readInteger(config, "startWeek", 2, 1, std::numeric_limits<int>::max());
+	if(newWeek < startWeek)
+		return;
+
+	const int64_t minLevel = readInteger(config, "minLevel", 7, 0, 1000);
+	const int64_t maxLevel = readInteger(config, "maxLevel", 10, minLevel, 1000);
+	const int64_t strengthPercent = readInteger(config, "strengthPercent", 60, 0, 1000000);
+	const int64_t tilesPerStack = readInteger(config, "tilesPerStack", 200, 1, std::numeric_limits<int>::max());
+	const int64_t maxAmount = readInteger(config, "maxAmount", 2000000, 1, std::numeric_limits<int>::max());
+
+	std::vector<CreatureID> candidates;
+	for(const auto & creature : LIBRARY->creh->objects)
+	{
+		if(!creature || creature->special || creature->getAIValue() <= 0)
+			continue;
+		if(creature->getLevel() < minLevel || creature->getLevel() > maxLevel)
+			continue;
+		candidates.push_back(creature->getId());
+	}
+	if(candidates.empty())
+	{
+		logGlobal->warn("Diplo weekly spawn: no creature of level %d-%d", minLevel, maxLevel);
+		return;
+	}
+
+	// Strongest neutral stack on the map before this week's spawn: sum of unit count x AI value.
+	uint64_t strongest = 0;
+	for(const auto * monster : gameHandler->gameState().getMap().getObjects<CGCreature>())
+		strongest = std::max<uint64_t>(strongest, monster->getArmyStrength());
+	const auto targetStrength = static_cast<long double>(strongest) * strengthPercent / 100;
+
+	std::vector<int3> tiles;
+	gameHandler->gameState().getFreeTiles(tiles, true);
+	const size_t stacks = tiles.size() / static_cast<size_t>(tilesPerStack);
+	RandomGeneratorUtil::randomShuffle(tiles, gameHandler->getRandomGenerator());
+
+	logGlobal->info("Diplo weekly spawn: week %d, %d stacks, strongest neutral %d", newWeek, stacks, strongest);
+	for(size_t i = 0; i < stacks && i < tiles.size(); ++i)
+	{
+		const CreatureID creatureID = *RandomGeneratorUtil::nextItem(candidates, gameHandler->getRandomGenerator());
+		const long double aiValue = creatureID.toCreature()->getAIValue();
+		const long double rawAmount = targetStrength / aiValue;
+		const int amount = static_cast<int>(std::clamp<long double>(rawAmount, 1, static_cast<long double>(maxAmount)));
+		gameHandler->createWanderingMonster(tiles[i], creatureID, amount);
+	}
+}
+}
+// DIPLO_ENGINE_END
+
 ResourceSet NewTurnProcessor::generatePlayerIncome(PlayerColor playerID, bool newWeek)
 {
 	const auto & playerSettings = gameHandler->gameInfo().getPlayerSettings(playerID);
@@ -255,7 +363,22 @@ ResourceSet NewTurnProcessor::generatePlayerIncome(PlayerColor playerID, bool ne
 	for (const auto * obj :	state.getOwnedObjects())
 		incomeHandicapped += obj->asOwnable()->dailyIncome();
 
-	if (!state.isHuman())
+	// DIPLO_ENGINE option 02: AI income = income x ratio x N x (1 + K x finishedWeeks); replaces the difficulty bonus below.
+	// Income is booked for the day about to start; the date has not been switched yet.
+	const int64_t diploDaysPerWeek = std::max<int64_t>(1, LIBRARY->engineSettings()->getInteger(EGameSettings::GENERAL_DAYS_PER_WEEK));
+	const int64_t diploIncomeFactor = state.isHuman() ? 0 : DiploEngine::aiFactor(gameHandler->gameInfo().getDate(Date::DAY) / diploDaysPerWeek, true);
+	if (diploIncomeFactor > 0)
+	{
+		for (GameResID i : LIBRARY->resourceTypeHandler->getAllObjects())
+		{
+			const int64_t stock = std::clamp<int64_t>(state.resources[i], 0, GameConstants::PLAYER_RESOURCES_CAP);
+			const int64_t room = GameConstants::PLAYER_RESOURCES_CAP - stock;
+			const int64_t dailyIncome = incomeHandicapped[i];
+			if (dailyIncome > 0)
+				incomeHandicapped[i] = DiploEngine::saturatingMultiply(dailyIncome, diploIncomeFactor, room);
+		}
+	}
+	else if (!state.isHuman())
 	{
 		// Initialize bonuses for different resources
 		int difficultyIndex = gameHandler->gameState().getStartInfo()->difficulty;
@@ -294,13 +417,18 @@ SetAvailableCreatures NewTurnProcessor::generateTownGrowth(const CGTownInstance 
 		if (t->creatures.at(k).second.empty())
 			continue;
 
-		uint32_t creaturesBefore = t->creatures.at(k).first;
-		uint32_t creatureGrowth = 0;
+		uint64_t creaturesBefore = t->creatures.at(k).first;
+		uint64_t creatureGrowth = 0;
 		const CCreature *cre = t->creatures.at(k).second.back().toCreature();
 
 		if (firstDay)
 		{
 			creatureGrowth = cre->getGrowth();
+			// DIPLO_ENGINE option 02: the first week's AI recruits use N as well (no finished week yet).
+			const auto * diploOwner = player.isValidPlayer() ? gameHandler->gameInfo().getPlayerState(player, false) : nullptr;
+			const int64_t diploFactor = diploOwner && !diploOwner->isHuman() ? DiploEngine::aiFactor(0, false) : 0;
+			if (diploFactor > 1)
+				creatureGrowth = DiploEngine::saturatingMultiply(creatureGrowth, diploFactor, std::numeric_limits<int32_t>::max());
 		}
 		else
 		{
@@ -319,7 +447,7 @@ SetAvailableCreatures NewTurnProcessor::generateTownGrowth(const CGTownInstance 
 		if (!player.isValidPlayer())
 			creatureGrowth /= 2;
 
-		uint32_t resultingCreatures = 0;
+		uint64_t resultingCreatures = 0;
 
 		if (weekType == EWeekType::PLAGUE)
 			resultingCreatures = creaturesBefore / 2;
@@ -328,7 +456,8 @@ SetAvailableCreatures NewTurnProcessor::generateTownGrowth(const CGTownInstance 
 		else
 			resultingCreatures = creaturesBefore + creatureGrowth;
 
-		sac.creatures.at(k).first = resultingCreatures;
+		// DIPLO_ENGINE: 64-bit sum, clamped to the engine's 32-bit creature counter.
+		sac.creatures.at(k).first = static_cast<int32_t>(std::min<uint64_t>(resultingCreatures, std::numeric_limits<int32_t>::max()));
 	}
 
 	return sac;
@@ -762,6 +891,10 @@ void NewTurnProcessor::onNewTurn()
 	{
 		gameHandler->spawnWanderingMonsters(n.creatureid);
 	}
+
+	// DIPLO_ENGINE option 12: weekly neutral stacks; the month rule above is unchanged.
+	if (newWeek && !firstTurn)
+		DiploEngine::spawnWeeklyMonsters(gameHandler, 1 + gameHandler->gameInfo().getDate(Date::DAY) / daysPerWeek);
 
 	logGlobal->trace("Info about turn %d has been sent!", n.day);
 }
