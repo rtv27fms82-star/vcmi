@@ -42,6 +42,10 @@
 #include "../networkPacks/PacksForClientBattle.h"
 #include "../serializer/JsonSerializeFormat.h"
 
+#include "../filesystem/Filesystem.h"
+#include "../json/JsonNode.h"
+
+#include <limits>
 #include <vstd/RNG.h>
 
 VCMI_LIB_NAMESPACE_BEGIN
@@ -123,6 +127,46 @@ int CGTownInstance::creatureGrowth(const int & level) const
 	return getGrowthInfo(level).totalGrowth();
 }
 
+// DIPLO_AI_GROWTH_BEGIN
+// Diplo option 02 (needs this source patch). Numbers come from the active Diplo submods:
+//   config/vnd30/engine/aiGrowthN.json  -> { "N": <multiplier> }
+//   config/vnd30/engine/aiGrowthK.json  -> { "K": <added multiplier per finished week> }
+// AI town growth of (base + Citadel/Castle) = N x (1 + K x finishedWeeks). Human players are not affected.
+namespace DiploAiGrowth
+{
+static JsonNode loadConfig(const std::string & path)
+{
+	const JsonPath resource = JsonPath::builtin(path);
+	if(!CResourceHandler::get()->existsResource(resource))
+		return JsonNode();
+	return JsonNode(resource);
+}
+
+static int64_t saturatingMultiply(int64_t a, int64_t b, int64_t limit)
+{
+	if(a <= 0 || b <= 0)
+		return 0;
+	if(a > limit / b)
+		return limit;
+	return std::min(a * b, limit);
+}
+
+/// Returns 0 when neither the N nor the K submod is active.
+int64_t townGrowthFactor(int64_t finishedWeeks)
+{
+	static const JsonNode configN = loadConfig("config/vnd30/engine/aiGrowthN.json");
+	static const JsonNode configK = loadConfig("config/vnd30/engine/aiGrowthK.json");
+	if(configN.isNull() && configK.isNull())
+		return 0;
+	const int64_t limit = 1000000000;
+	const int64_t multiplierN = configN["N"].isNumber() ? std::clamp<int64_t>(configN["N"].Integer(), 0, limit) : 1;
+	const int64_t multiplierK = configK["K"].isNumber() ? std::clamp<int64_t>(configK["K"].Integer(), 0, limit) : 0;
+	const int64_t ramp = std::min(limit, 1 + saturatingMultiply(multiplierK, std::max<int64_t>(finishedWeeks, 0), limit));
+	return saturatingMultiply(multiplierN, ramp, limit);
+}
+}
+// DIPLO_AI_GROWTH_END
+
 GrowthInfo CGTownInstance::getGrowthInfo(int level) const
 {
 	GrowthInfo ret;
@@ -167,6 +211,21 @@ GrowthInfo CGTownInstance::getGrowthInfo(int level) const
 		if (growth)
 		{
 			ret.entries.emplace_back(growth, b->Description(cb, growth));
+		}
+	}
+
+	// DIPLO_AI_GROWTH: AI owner only, see DiploAiGrowth above.
+	if(const auto * diploOwner = tempOwner.isValidPlayer() ? cb->getPlayerState(tempOwner, false) : nullptr; diploOwner && !diploOwner->isHuman())
+	{
+		const int64_t daysPerWeek = std::max<int64_t>(1, LIBRARY->engineSettings()->getInteger(EGameSettings::GENERAL_DAYS_PER_WEEK));
+		// At the last day of a week the engine creates the next week's recruits, so this counts that week.
+		const int64_t finishedWeeks = cb->getDate(Date::DAY) / daysPerWeek;
+		const int64_t factor = DiploAiGrowth::townGrowthFactor(finishedWeeks);
+		if(factor > 1)
+		{
+			const int64_t extra = DiploAiGrowth::saturatingMultiply(static_cast<int64_t>(base) + castleBonus, factor - 1, 100000000);
+			if(extra > 0)
+				ret.entries.emplace_back(static_cast<int>(extra), "Diplo AI: N x (1 + K x weeks)");
 		}
 	}
 
@@ -1234,12 +1293,14 @@ GrowthInfo::Entry::Entry(int _count, std::string fullDescription):
 
 int GrowthInfo::totalGrowth() const
 {
-	int ret = 0;
+	int64_t ret = 0;
 	for(const Entry &entry : entries)
 		ret += entry.count;
 
 	// always round up income - we don't want buildings to always produce zero if handicap in use
-	return vstd::divideAndCeil(ret * handicapPercentage, 100);
+	// DIPLO_AI_GROWTH: 64-bit sum, so large Diplo AI growth cannot overflow.
+	const int64_t result = vstd::divideAndCeil(ret * handicapPercentage, int64_t{100});
+	return static_cast<int>(std::clamp<int64_t>(result, 0, std::numeric_limits<int>::max()));
 }
 
 void CGTownInstance::fillUpgradeInfo(UpgradeInfo & info, const CStackInstance &stack) const
