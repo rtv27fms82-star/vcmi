@@ -31,6 +31,10 @@
 #include "../Functions.h"
 #include "../RmgObject.h"
 
+#include "../../filesystem/Filesystem.h"
+#include "../../json/JsonNode.h"
+
+#include <limits>
 #include <vstd/RNG.h>
 
 VCMI_LIB_NAMESPACE_BEGIN
@@ -727,6 +731,39 @@ void ObjectManager::placeObject(rmg::Object & object, bool guarded, bool updateD
 	}
 }
 
+// DIPLO_NEUTRAL_AMOUNT_BEGIN
+// Diplo option 11 (needs this source patch). Active only with the submod file
+// config/vnd30/engine/neutralAmount.json -> { "min": 1, "max": 10000, "template": "<template id or empty for all>" }.
+// The creature type is still chosen from the guard strength; only the unit count is replaced.
+namespace DiploNeutralAmount
+{
+static JsonNode loadConfig()
+{
+	const JsonPath resource = JsonPath::builtin("config/vnd30/engine/neutralAmount.json");
+	if(!CResourceHandler::get()->existsResource(resource))
+		return JsonNode();
+	return JsonNode(resource);
+}
+
+static std::optional<std::pair<int, int>> range(const CMapGenOptions & options)
+{
+	static const JsonNode config = loadConfig();
+	if(config.isNull())
+		return std::nullopt;
+	const std::string templateId = config["template"].isString() ? config["template"].String() : std::string();
+	if(!templateId.empty())
+	{
+		const auto * tmpl = options.getMapTemplate();
+		if(!tmpl || tmpl->getId() != templateId)
+			return std::nullopt;
+	}
+	const int64_t minAmount = config["min"].isNumber() ? std::clamp<int64_t>(config["min"].Integer(), 1, std::numeric_limits<int>::max()) : 1;
+	const int64_t maxAmount = config["max"].isNumber() ? std::clamp<int64_t>(config["max"].Integer(), minAmount, std::numeric_limits<int>::max()) : minAmount;
+	return std::make_pair(static_cast<int>(minAmount), static_cast<int>(maxAmount));
+}
+}
+// DIPLO_NEUTRAL_AMOUNT_END
+
 std::shared_ptr<CGCreature> ObjectManager::chooseGuard(si32 strength, bool zoneGuard)
 {
 	//precalculate actual (randomized) monster strength based on this post
@@ -777,6 +814,10 @@ std::shared_ptr<CGCreature> ObjectManager::chooseGuard(si32 strength, bool zoneG
 		creId = CreatureID::AZURE_DRAGON; //Azure Dragon
 		amount = strength / creId.toEntity(LIBRARY)->getAIValue();
 	}
+
+	// DIPLO_NEUTRAL_AMOUNT: uniform unit count, same creature type as chosen above.
+	if(const auto diploRange = DiploNeutralAmount::range(map.getMapGenOptions()))
+		amount = zone.getRand().nextInt(diploRange->first, diploRange->second);
 	
 	auto guardFactory = LIBRARY->objtypeh->getHandlerFor(Obj::MONSTER, creId);
 
